@@ -69,7 +69,7 @@ impl<T> Future for RpcFuture<T> {
 /// Stream wrapper for subscription
 pub struct RpcSubscription<T, S, F>
 where
-	S: Stream<Item = Result<T, RpcError>, Error = ()>,
+	S: Stream<Item = T, Error = RpcError>,
 	F: FnOnce(),
 {
 	stream: Option<S>,
@@ -78,7 +78,7 @@ where
 
 impl<T, S, F> RpcSubscription<T, S, F>
 where
-	S: Stream<Item = Result<T, RpcError>, Error = ()>,
+	S: Stream<Item = T, Error = RpcError>,
 	F: FnOnce(),
 {
 	/// Construct new subscription
@@ -97,7 +97,7 @@ where
 
 impl<T, S, F> Drop for RpcSubscription<T, S, F>
 where
-	S: Stream<Item = Result<T, RpcError>, Error = ()>,
+	S: Stream<Item = T, Error = RpcError>,
 	F: FnOnce(),
 {
 	fn drop(&mut self) {
@@ -157,7 +157,7 @@ pub enum RpcMessage {
 #[derive(Debug)]
 pub struct RpcSubscribeMessage {
 	id: Id,
-	sender: mpsc::Sender<Result<Value, Error>>,
+	sender: mpsc::Sender<Value>,
 	res_sender: oneshot::Sender<Result<(), Error>>,
 }
 
@@ -188,7 +188,7 @@ pub type RpcChannel = mpsc::Sender<RpcMessage>;
 pub struct RpcClient<TSink, TStream> {
 	id: u64,
 	queue: HashMap<Id, oneshot::Sender<Result<Value, Error>>>,
-	subscriptions: HashMap<Id, mpsc::Sender<Result<Value, Error>>>,
+	subscriptions: HashMap<Id, mpsc::Sender<Value>>,
 	sink: TSink,
 	stream: TStream,
 	channel: Option<mpsc::Receiver<RpcMessage>>,
@@ -320,7 +320,7 @@ where
 			} else if let Ok(response) = serde_json::from_str::<RpcNotification>(&response_str) {
 				if let Some(subscription) = self.subscriptions.get_mut(&response.id()) {
 					subscription
-						.try_send(Ok(response.params.result))
+						.try_send(response.params.result)
 						.map_err(|_| RpcError::Other(format_err!("subscription channel closed")))?;
 				}
 			} else {
@@ -368,11 +368,7 @@ impl RawClient {
 	}
 
 	/// Subscribe producer to receive messages with id
-	pub fn subscribe(
-		&self,
-		id: Id,
-		sender: mpsc::Sender<Result<Value, Error>>,
-	) -> impl Future<Item = Id, Error = RpcError> {
+	pub fn subscribe(&self, id: Id, sender: mpsc::Sender<Value>) -> impl Future<Item = Id, Error = RpcError> {
 		let (res_sender, res_receiver) = oneshot::channel();
 		let msg = RpcMessage::Subscribe(RpcSubscribeMessage {
 			id: id.clone(),
@@ -451,31 +447,41 @@ impl TypedClient {
 		&self,
 		method: &str,
 		args: T,
-	) -> impl Future<
-		Item = RpcSubscription<R, impl Stream<Item = Result<R, RpcError>, Error = ()>, impl FnOnce()>,
-		Error = RpcError,
-	>
+		unsubscribe_method: &str,
+	) -> impl Future<Item = RpcSubscription<R, impl Stream<Item = R, Error = RpcError>, impl FnOnce()>, Error = RpcError>
 	where
 		T: Serialize,
 		R: DeserializeOwned + 'static,
 	{
+		let sub_client = self.0.clone();
+		let unsub_client = self.0.clone();
+		let unsub_method = unsubscribe_method.to_owned();
+
 		let (sender, receiver) = mpsc::channel(0);
-		let receiver = receiver.map(|val: Result<Value, Error>| {
-			val.map_err(|error| RpcError::Other(error.into())).and_then(|val| {
+		let receiver = receiver.then(|val: Result<Value, ()>| {
+			val.map_err(|_| RpcError::UnknownId).and_then(|val| {
 				serde_json::from_value::<R>(val)
 					.map_err(|error| RpcError::ParseError("stream subscription value".into(), error.into()))
 			})
 		});
-		let rpc_channel = self.0.clone();
-		let unsub_channel = self.0.clone();
+
 		self.call_method(method, "subscription", args)
 			.and_then(move |id: String| {
 				let id = Id::Str(id.clone());
-				rpc_channel.subscribe(id, sender)
+				sub_client.subscribe(id, sender)
 			})
 			.and_then(move |id| {
 				let unsubscribe = move || {
-					tokio::spawn(unsub_channel.unsubscribe(id));
+					tokio::spawn(
+						unsub_client
+							.call_method(
+								&unsub_method,
+								Params::Array(vec![serde_json::to_value(id.clone()).unwrap()]),
+							)
+							.map(|_| ())
+							.map_err(|_| ()),
+					);
+					tokio::spawn(unsub_client.unsubscribe(id));
 				};
 				future::ok(RpcSubscription::new(receiver, unsubscribe))
 			})
